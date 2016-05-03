@@ -1,0 +1,246 @@
+#!/usr/bin/perl
+
+use DateTime;
+use File::Copy;
+use JSON::RPC::Legacy::Client;
+use strict;
+
+# This is vdr's timers.conf
+my $timers_file = "/etc/vdr/timers.conf";
+my $recording_log = "/var/log/recording.log";
+
+my $log = undef;
+open($log, ">>$recording_log");
+
+# Use this as prefix in the recording log
+my $now_time = time();
+my $now = localtime($now_time);
+
+print $log "$now: \@ARGV = @ARGV\n";
+
+# I am only interested in the hook called after the recording
+
+if(!grep { $_ eq 'after' } @ARGV) {
+  exit;
+}
+
+print $log "$now: Hi there\n";
+
+# Back up the current timers conf for means of debugging.
+
+print $log "$now: backing up timers.conf -> timers.conf.$now_time\n";
+copy("$timers_file","$timers_file.$now_time") or die "Copy failed: $!";
+
+# We won't suspend the computer if the next timer is within this
+# treshhold. Additionally we subtract an additional prefix from the next
+# starting timer, i.e. we set the wakeup-timer "$prefix" before the timer
+# starts.
+# At the moment we set both values to 10 minutes. As we use seconds since epoch
+# (epoch = 01.01.1970) throughout the script for calculations, we also convert
+# the treshhold and the prefix into seconds since epoch.
+
+my $treshhold = DateTime->new(year => 1970,
+                              month => 1,
+                              day => 1,
+                              hour => 0,
+                              minute => 10,
+                              second => 0);
+$treshhold = $treshhold->epoch();
+my $prefix = DateTime->new(year => 1970,
+                              month => 1,
+                              day => 1,
+                              hour => 0,
+                              minute => 10,
+                              second => 0);
+$prefix = $prefix->epoch();
+
+my $next_wakeup = get_next_wakeup($timers_file, $now_time);
+print $log "$now: \$next_wakeup = $next_wakeup\n";
+
+if($next_wakeup == 0) {
+  exit;
+}
+
+# If we get a wakeup time, we set the wakeup-timer appropriately. For
+# now, I just reuse the script /usr/bin/setwakeup.sh for that
+# purpose. Maybe, I can reimplement this using perl only, so I can
+# avoid the call of /usr/bin/setwakeup.sh using the back-ticks.
+
+if($next_wakeup > 0) {
+  my $time_string = localtime($next_wakeup);
+  print $log "$now: /usr/bin/setwakeup.sh $next_wakeup ($time_string)\n";
+  my $output = `sudo /usr/bin/setwakeup.sh $next_wakeup`;
+  print $log "$now: \$output = $output\n";
+}
+
+if(confirm_hibernate() == 0) {
+  print $log "$now: hibernation canceled\n";
+  exit;
+}
+
+# Finally, we hibernate the system. Again, we just call systemctl (as I don't
+# know any other way to accomplish this using perl ...).
+print $log "$now: Hibernating now!\n";
+my $output = `sudo /usr/bin/systemctl hibernate`;
+print $log "$now: \$output = $output\n";
+close($log);
+
+# get_next_wakeup either returns
+# - the next wakeup time, i.e. a number > 0, this will be passed to setwakeup.sh
+# - -1 -> the system will be hibernated without scheduled wakeup
+# - 0  -> the system will not be hibernated at all
+
+sub get_next_wakeup {
+  my $timers_file = shift;
+  my $current_time = shift;
+  my $timers = undef;
+
+  if(!open($timers, "<$timers_file")) {
+    die "Failed to open timers file \"$timers_file\"\n";
+  }
+
+  # The default return value is -1, it indicates that there are no more pending
+  # recordings and we don't need to setup a wakeup timer.
+
+  my $result = -1;
+  print $log "$now: \$current_time = $current_time ".localtime($current_time)."\n";
+
+  while(<$timers>) {
+    chomp;
+    my $timer = $_;
+    print $log "$now: \$timer = $timer\n";
+
+    my @values = split(':', $timer);
+
+    my $state = $values[0];
+    my $day   = $values[2];
+    my $start = $values[3];
+    my $stop  = $values[4];
+
+    print $log "$now: \$state = $state\n";
+    print $log "$now: \$day = $day\n";
+
+    # At the moment we do not handle timers that expire repeatedly, i.e. that
+    # start a recording every monday, tuesday and wednesday.
+
+    if($day =~ /--/) {
+      next;
+    }
+
+    my @date = split('-', $day);
+    my $date_year = $date[0];
+    my $date_mon = $date[1];
+    my $date_day = $date[2];
+
+    my @stop = $stop =~ /(\d{2,2})(\d{2,2})/;
+
+    my $stop_hour = $stop[0];
+    my $stop_min = $stop[1];
+
+    my $stop_time = DateTime->new(year => $date_year,
+                                  month => $date_mon,
+                                  day => $date_day,
+                                  hour => $stop_hour,
+                                  minute => $stop_min,
+                                  second => 0,
+                                  time_zone => 'Europe/Berlin');
+    $stop_time = $stop_time->epoch();
+    print $log "$now: \$stop_time = $stop_time ".localtime($stop_time)."\n";
+
+    # If a recording is ongoing we return 0 to indicate that the computer should
+    # not be shut down right now.
+
+    # Unfortunately, the recording just finished also is marked as ongoing, so
+    # we have to check its stop time. Only, if the stop time is greater than the
+    # current time, we will not shut down the recording.
+
+    if($state & 8) {
+      print $log "$now: Checking stop time\n";
+      if($stop_time > $current_time) {
+        $result = 0;
+        last;
+      }
+    }
+
+    if($state == 1) {
+      my @start = $start =~ /(\d{2,2})(\d{2,2})/;
+
+      my $start_hour = $start[0];
+      my $start_min = $start[1];
+
+      my $start_time = DateTime->new(year => $date_year,
+                                     month => $date_mon,
+                                     day => $date_day,
+                                     hour => $start_hour,
+                                     minute => $start_min,
+                                     second => 0,
+                                     time_zone => 'Europe/Berlin');
+      $start_time = $start_time->epoch();
+
+      print $log "$now: \$start_time = $start_time ".localtime($start_time)."\n";
+
+      my $next_wakeup = $start_time - $prefix;
+      my $diff_time = $next_wakeup - $current_time;
+
+      if(($diff_time > $treshhold) && ($result == -1 || $result > $next_wakeup)) {
+        $result = $next_wakeup;
+      }
+      elsif($diff_time <= $treshhold) {
+        $result = 0;
+        last;
+      }
+    }
+  }
+
+  close($timers);
+
+  return $result;
+}
+
+sub confirm_hibernate {
+  my $do_hibernate_file = '/tmp/kodi_doshutdown';
+  my $stop_hibernate_file = '/tmp/kodi_stopshutdown';
+
+  # Then I activate the Kodi-plugin
+
+  my $client = new JSON::RPC::Legacy::Client;
+  my $uri = 'http://[KODIURL]/jsonrpc';
+
+  my $callobj = {
+    jsonrpc => '2.0',
+    method  => 'Addons.ExecuteAddon',
+    params  => {
+      addonid => 'script.confirm_hibernate'
+    }
+  };
+
+  $client->id(1);
+  $client->version('2.0');
+
+  my $call_result = $client->call($uri, $callobj);
+
+  # If the call fails I am going to hibernate the whole system
+  # anyways
+
+  if($call_result && $call_result->is_error()) {
+    print $log "$now: JSON RPC call failed\n";
+    return 1;
+  }
+
+  # Wait for the Kodi-plugin to finish and then check for the
+  # $stop_hibernate-file, if it exists I will not hibernate,
+  # otherwise I will.
+
+  print $log "$now: Waiting for Kodi-plugin to finish\n";
+
+  sleep(10);
+
+  if(-f $stop_hibernate_file) {
+    print $log "$now: Cancel hibernation due to user request\n";
+    return 0;
+  }
+  else {
+    print $log "$now: \"$stop_hibernate_file\" does not exist!\n";
+    return 1;
+  }
+}
